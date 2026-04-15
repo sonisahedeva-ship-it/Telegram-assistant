@@ -14,25 +14,49 @@ conversation_history = []
 
 SYSTEM_PROMPT = """You are a sharp, efficient personal assistant. Not a generic chatbot.
 
-CRITICAL RULE: You MUST use the web_search tool before answering ANY of these:
-- Weather or temperature questions (ALWAYS search, never guess)
+You have web_search access. Use it for:
 - Finding doctors, clinics, restaurants, any local business
 - Flight prices or availability
 - Current news or recent events
 - Prices of anything
-- Anything that changes day to day
 
-NEVER answer from memory for the above topics. Always search first, then answer.
-
-For tasks like drafting emails or explaining concepts, you can answer directly.
+For weather questions, the bot already fetches live weather data and injects it into your context.
+So if you see "LIVE WEATHER DATA:" in the message, use that data directly - do not search for weather.
 
 Rules:
 - Return specific results: names, addresses, phone numbers, links
 - Be concise, use bullet points
-- User is based in Ahmedabad, India. Use this for all location searches.
+- User is based in Ahmedabad, India
 - Never ask unnecessary questions. Ask ONE question max if truly needed."""
 
 TOOLS = [{"type": "web_search_20250305", "name": "web_search"}]
+
+WEATHER_KEYWORDS = ["weather", "temperature", "temp", "degrees", "rain", "humid",
+                    "forecast", "hot", "cold", "climate today", "sunny", "cloudy"]
+
+def get_live_weather(city="Ahmedabad"):
+    try:
+        resp = requests.get(f"https://wttr.in/{city}?format=j1", timeout=10)
+        data = resp.json()
+        current = data["current_condition"][0]
+        temp_c = current["temp_C"]
+        feels_c = current["FeelsLikeC"]
+        humidity = current["humidity"]
+        desc = current["weatherDesc"][0]["value"]
+        return (
+            f"LIVE WEATHER DATA for {city} right now:\n"
+            f"Temperature: {temp_c} degrees C\n"
+            f"Feels like: {feels_c} degrees C\n"
+            f"Humidity: {humidity}%\n"
+            f"Condition: {desc}\n"
+            f"(This is live data fetched directly from a weather API)"
+        )
+    except Exception as e:
+        return None
+
+def is_weather_query(text):
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in WEATHER_KEYWORDS)
 
 def send_message(chat_id, text):
     chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
@@ -58,7 +82,15 @@ def get_updates(offset=None):
 
 def ask_claude(user_message):
     global conversation_history
-    conversation_history.append({"role": "user", "content": user_message})
+
+    # Inject live weather if it's a weather question
+    enriched_message = user_message
+    if is_weather_query(user_message):
+        weather_data = get_live_weather()
+        if weather_data:
+            enriched_message = f"{user_message}\n\n{weather_data}"
+
+    conversation_history.append({"role": "user", "content": enriched_message})
     trimmed = conversation_history[-20:]
 
     response = client.messages.create(
@@ -70,24 +102,21 @@ def ask_claude(user_message):
         tool_choice={"type": "auto"}
     )
 
-    # Handle tool use loop - Claude may search multiple times before final answer
+    # Handle tool use loop
     messages = list(trimmed)
     current_response = response
 
     while current_response.stop_reason == "tool_use":
         tool_uses = [b for b in current_response.content if b.type == "tool_use"]
         tool_results = []
-
         for tool_use in tool_uses:
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": tool_use.id,
                 "content": "Search executed."
             })
-
         messages.append({"role": "assistant", "content": current_response.content})
         messages.append({"role": "user", "content": tool_results})
-
         current_response = client.messages.create(
             model="claude-opus-4-5",
             max_tokens=1024,
@@ -96,7 +125,6 @@ def ask_claude(user_message):
             messages=messages
         )
 
-    # Extract final text reply
     reply = ""
     for block in current_response.content:
         if hasattr(block, "text"):
@@ -118,9 +146,10 @@ def handle_command(cmd, chat_id):
     elif cmd == "/help":
         send_message(chat_id,
             "What I can do:\n"
+            "- Live weather (direct API)\n"
             "- Search the web for live info\n"
             "- Find doctors, restaurants, services near Ahmedabad\n"
-            "- Current weather, flights, news\n"
+            "- Current news, flights, prices\n"
             "- Draft emails, messages, content\n"
             "- Summarise text you paste\n\n"
             "Commands:\n"
@@ -129,7 +158,7 @@ def handle_command(cmd, chat_id):
         )
 
 def main():
-    print("Bot is running with web search...")
+    print("Bot is running with live weather + web search...")
     offset = None
 
     while True:
