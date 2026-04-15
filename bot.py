@@ -14,17 +14,22 @@ conversation_history = []
 
 SYSTEM_PROMPT = """You are a sharp, efficient personal assistant. Not a generic chatbot.
 
-You have web search access. Use it proactively for:
-- Finding doctors, restaurants, services near Ahmedabad
-- Current news, prices, weather
-- Anything requiring up-to-date facts
+CRITICAL RULE: You MUST use the web_search tool before answering ANY of these:
+- Weather or temperature questions (ALWAYS search, never guess)
+- Finding doctors, clinics, restaurants, any local business
+- Flight prices or availability
+- Current news or recent events
+- Prices of anything
+- Anything that changes day to day
+
+NEVER answer from memory for the above topics. Always search first, then answer.
+
+For tasks like drafting emails or explaining concepts, you can answer directly.
 
 Rules:
-- Search the web first if the answer needs real-world data
 - Return specific results: names, addresses, phone numbers, links
 - Be concise, use bullet points
-- Never give generic advice when you can give a real answer
-- User is based in Ahmedabad, India
+- User is based in Ahmedabad, India. Use this for all location searches.
 - Never ask unnecessary questions. Ask ONE question max if truly needed."""
 
 TOOLS = [{"type": "web_search_20250305", "name": "web_search"}]
@@ -61,16 +66,44 @@ def ask_claude(user_message):
         max_tokens=1024,
         system=SYSTEM_PROMPT,
         tools=TOOLS,
-        messages=trimmed
+        messages=trimmed,
+        tool_choice={"type": "auto"}
     )
 
+    # Handle tool use loop - Claude may search multiple times before final answer
+    messages = list(trimmed)
+    current_response = response
+
+    while current_response.stop_reason == "tool_use":
+        tool_uses = [b for b in current_response.content if b.type == "tool_use"]
+        tool_results = []
+
+        for tool_use in tool_uses:
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": tool_use.id,
+                "content": "Search executed."
+            })
+
+        messages.append({"role": "assistant", "content": current_response.content})
+        messages.append({"role": "user", "content": tool_results})
+
+        current_response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            system=SYSTEM_PROMPT,
+            tools=TOOLS,
+            messages=messages
+        )
+
+    # Extract final text reply
     reply = ""
-    for block in response.content:
+    for block in current_response.content:
         if hasattr(block, "text"):
             reply += block.text
 
     if not reply:
-        reply = "I searched but could not find a clear answer. Try rephrasing?"
+        reply = "Could not find a clear answer. Try rephrasing?"
 
     conversation_history.append({"role": "assistant", "content": reply})
     return reply
@@ -87,7 +120,7 @@ def handle_command(cmd, chat_id):
             "What I can do:\n"
             "- Search the web for live info\n"
             "- Find doctors, restaurants, services near Ahmedabad\n"
-            "- Find flights, prices, current news\n"
+            "- Current weather, flights, news\n"
             "- Draft emails, messages, content\n"
             "- Summarise text you paste\n\n"
             "Commands:\n"
