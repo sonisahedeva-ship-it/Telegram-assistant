@@ -2,42 +2,34 @@ import os
 import anthropic
 import requests
 import time
-import json
 
-# ── Config from environment variables ──────────────────────────────────────────
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]       # from BotFather
-CLAUDE_API_KEY   = os.environ["CLAUDE_API_KEY"]        # from console.anthropic.com
-ALLOWED_USER_ID  = int(os.environ["ALLOWED_USER_ID"])  # your Telegram user ID (number)
+TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
+CLAUDE_API_KEY  = os.environ["CLAUDE_API_KEY"]
+ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-
 client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
 
-# ── Conversation memory (per session) ──────────────────────────────────────────
 conversation_history = []
 
-SYSTEM_PROMPT = """You are a sharp, efficient personal assistant. You are NOT a generic chatbot.
+SYSTEM_PROMPT = """You are a sharp, efficient personal assistant. Not a generic chatbot.
 
-Your job is to complete tasks, not have conversations. When given a task:
-- Find real, specific answers (not generic advice)
-- Be concise — bullet points over paragraphs
-- If you don't know something current, say so clearly
-- Always give actionable output: names, numbers, addresses, links
+You have web search access. Use it proactively for:
+- Finding doctors, restaurants, services near Ahmedabad
+- Current news, prices, weather
+- Anything requiring up-to-date facts
 
-The user is based in Ahmedabad, India. Keep this in mind for location-based tasks.
+Rules:
+- Search the web first if the answer needs real-world data
+- Return specific results: names, addresses, phone numbers, links
+- Be concise, use bullet points
+- Never give generic advice when you can give a real answer
+- User is based in Ahmedabad, India
+- Never ask unnecessary questions. Ask ONE question max if truly needed."""
 
-Examples of how you respond:
-- "Find a dentist near Satellite" → Return 3 specific clinics with address + phone number
-- "Draft a follow-up email" → Return the email, ready to copy-paste
-- "Remind me at 6pm" → Acknowledge and confirm the reminder
+TOOLS = [{"type": "web_search_20250305", "name": "web_search"}]
 
-Never ask unnecessary follow-up questions. Make reasonable assumptions and complete the task.
-If you truly need clarification, ask ONE question only."""
-
-# ── Telegram helpers ────────────────────────────────────────────────────────────
-def send_message(chat_id: int, text: str):
-    """Send a message back to the user on Telegram."""
-    # Telegram has a 4096 char limit — split if needed
+def send_message(chat_id, text):
     chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
     for chunk in chunks:
         requests.post(f"{TELEGRAM_API}/sendMessage", json={
@@ -46,104 +38,98 @@ def send_message(chat_id: int, text: str):
             "parse_mode": "Markdown"
         })
 
-def send_typing(chat_id: int):
-    """Show 'typing...' indicator while Claude thinks."""
+def send_typing(chat_id):
     requests.post(f"{TELEGRAM_API}/sendChatAction", json={
         "chat_id": chat_id,
         "action": "typing"
     })
 
-def get_updates(offset: int = None):
-    """Long-poll Telegram for new messages."""
+def get_updates(offset=None):
     params = {"timeout": 30}
     if offset:
         params["offset"] = offset
     resp = requests.get(f"{TELEGRAM_API}/getUpdates", params=params, timeout=35)
     return resp.json().get("result", [])
 
-# ── Claude ─────────────────────────────────────────────────────────────────────
-def ask_claude(user_message: str) -> str:
-    """Send message to Claude, maintaining conversation history."""
+def ask_claude(user_message):
     global conversation_history
-
     conversation_history.append({"role": "user", "content": user_message})
-
-    # Keep last 20 messages to avoid token bloat
     trimmed = conversation_history[-20:]
 
     response = client.messages.create(
         model="claude-opus-4-5",
         max_tokens=1024,
         system=SYSTEM_PROMPT,
+        tools=TOOLS,
         messages=trimmed
     )
 
-    reply = response.content[0].text
-    conversation_history.append({"role": "assistant", "content": reply})
+    reply = ""
+    for block in response.content:
+        if hasattr(block, "text"):
+            reply += block.text
 
+    if not reply:
+        reply = "I searched but could not find a clear answer. Try rephrasing?"
+
+    conversation_history.append({"role": "assistant", "content": reply})
     return reply
 
-# ── Commands ───────────────────────────────────────────────────────────────────
-def handle_command(cmd: str, chat_id: int):
+def handle_command(cmd, chat_id):
     if cmd == "/start":
-        send_message(chat_id, "👋 *Assistant ready.* Just tell me what you need.")
+        send_message(chat_id, "Assistant ready. Just tell me what you need.")
     elif cmd == "/clear":
         global conversation_history
         conversation_history = []
-        send_message(chat_id, "🧹 Memory cleared. Fresh start.")
+        send_message(chat_id, "Memory cleared. Fresh start.")
     elif cmd == "/help":
-        send_message(chat_id, (
-            "*What I can do:*\n"
-            "• Answer questions with real info\n"
-            "• Draft emails, messages, content\n"
-            "• Summarise text you paste\n"
-            "• Help with work tasks on the go\n\n"
-            "*Commands:*\n"
-            "/clear — Reset conversation memory\n"
-            "/help — Show this message"
-        ))
+        send_message(chat_id,
+            "What I can do:\n"
+            "- Search the web for live info\n"
+            "- Find doctors, restaurants, services near Ahmedabad\n"
+            "- Find flights, prices, current news\n"
+            "- Draft emails, messages, content\n"
+            "- Summarise text you paste\n\n"
+            "Commands:\n"
+            "/clear - Reset conversation memory\n"
+            "/help - Show this message"
+        )
 
-# ── Main loop ──────────────────────────────────────────────────────────────────
 def main():
-    print("✅ Bot is running...")
+    print("Bot is running with web search...")
     offset = None
 
     while True:
         try:
             updates = get_updates(offset)
-
             for update in updates:
                 offset = update["update_id"] + 1
                 message = update.get("message", {})
-
                 if not message:
                     continue
 
                 chat_id = message["chat"]["id"]
                 user_id = message["from"]["id"]
-                text    = message.get("text", "").strip()
+                text = message.get("text", "").strip()
 
-                # Security: only respond to your account
                 if user_id != ALLOWED_USER_ID:
-                    send_message(chat_id, "⛔ Unauthorized.")
+                    send_message(chat_id, "Unauthorized.")
                     continue
 
                 if not text:
                     send_message(chat_id, "Send me a text message.")
                     continue
 
-                # Handle commands
                 if text.startswith("/"):
                     handle_command(text.split()[0], chat_id)
                     continue
 
-                # Normal message → Claude
                 send_typing(chat_id)
                 reply = ask_claude(text)
                 send_message(chat_id, reply)
 
         except requests.exceptions.Timeout:
-            pass  # Normal for long-polling, just continue
+            pass
         except Exception as e:
             print(f"Error: {e}")
             time.sleep(3)
