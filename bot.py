@@ -241,6 +241,36 @@ def good_morning(chat_id):
     except:
         insight = "Start with your hardest task. Everything after that feels easy."
 
+    # Pull top 3 news from yesterday
+    news_line = ""
+    try:
+        news_resp = client.messages.create(
+            model="claude-opus-4-5", max_tokens=300,
+            system="You are a news briefer. Search for top news from the last 24 hours. Return exactly 3 stories. Format each as: emoji + bold headline + one sentence. Prioritise anything major or surprising. Keep total under 150 words.",
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content": "Top 3 news stories from the last 24 hours including any major or surprising news."}]
+        )
+        # Handle tool loop
+        msgs = [{"role": "user", "content": "Top 3 news stories from the last 24 hours."}]
+        current = news_resp
+        loop = 0
+        while current.stop_reason == "tool_use" and loop < 3:
+            loop += 1
+            tool_uses = [b for b in current.content if b.type == "tool_use"]
+            results = [{"type": "tool_result", "tool_use_id": t.id, "content": "done"} for t in tool_uses]
+            msgs.append({"role": "assistant", "content": current.content})
+            msgs.append({"role": "user", "content": results})
+            current = client.messages.create(
+                model="claude-opus-4-5", max_tokens=300,
+                system="Return exactly 3 top news stories from last 24 hours. emoji + bold headline + one sentence each.",
+                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                messages=msgs)
+        news_text = "".join(b.text for b in current.content if hasattr(b, "text")).strip()
+        if news_text:
+            news_line = f"\n\n*Top news today:*\n{news_text}"
+    except Exception as e:
+        print(f"Morning news error: {e}")
+
     # Pull any pending unfinished items
     unfinished = sb_get("logs", "type=eq.unfinished&order=created_at.asc&limit=1&select=content")
     unfinished_line = ""
@@ -250,6 +280,7 @@ def good_morning(chat_id):
     send_message(chat_id,
         f"Good morning! Happy {day}, {date}.\n\n"
         f"{insight}"
+        f"{news_line}"
         f"{unfinished_line}\n\n"
         f"Let's set up your day. Tell me:\n"
         f"1. How did you sleep? (1-10)\n"
