@@ -166,15 +166,23 @@ def is_weather_query(text):
     return any(kw in text.lower() for kw in WEATHER_KEYWORDS)
 
 # ── Telegram ─────────────────────────────────────────────────────────────────────
-def send_message(chat_id, text):
+def send_message(chat_id, text, reply_markup=None):
     try:
         for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
-            requests.post(f"{TELEGRAM_API}/sendMessage", json={
+            payload = {
                 "chat_id": chat_id, "text": chunk,
                 "parse_mode": "Markdown", "disable_web_page_preview": True
-            }, timeout=10)
+            }
+            if reply_markup:
+                payload["reply_markup"] = reply_markup
+            requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
     except Exception as e:
         print(f"send_message error: {e}")
+
+def send_buttons(chat_id, text, buttons):
+    """Send message with inline button options."""
+    keyboard = {"inline_keyboard": [[{"text": b, "callback_data": b}] for b in buttons]}
+    send_message(chat_id, text, reply_markup=keyboard)
 
 def send_typing(chat_id):
     try:
@@ -184,11 +192,47 @@ def send_typing(chat_id):
         pass
 
 def get_updates(offset=None):
-    params = {"timeout": 30}
+    params = {"timeout": 30, "allowed_updates": ["message", "callback_query"]}
     if offset:
         params["offset"] = offset
     resp = requests.get(f"{TELEGRAM_API}/getUpdates", params=params, timeout=35)
     return resp.json().get("result", [])
+
+def answer_callback(callback_id):
+    requests.post(f"{TELEGRAM_API}/answerCallbackQuery",
+                  json={"callback_query_id": callback_id}, timeout=5)
+
+def handle_evening_callback(step, answer, chat_id):
+    """Multi-step evening review via buttons."""
+    if step == "overall":
+        log_entry("evening", f"Overall day: {answer}")
+        send_buttons(chat_id,
+            f"Got it - *{answer}*. Did you complete your main priorities?",
+            ["All of them", "Most of them", "Some of them", "None of them"]
+        )
+    elif step == "priorities":
+        log_entry("evening", f"Priorities completed: {answer}")
+        send_buttons(chat_id,
+            "What was your energy like today?",
+            ["High all day", "High then crashed", "Low but steady", "Very low"]
+        )
+    elif step == "energy":
+        log_entry("evening", f"Energy: {answer}")
+        send_buttons(chat_id,
+            "How was your mood today?",
+            ["Great", "Good", "Neutral", "Stressed", "Low"]
+        )
+    elif step == "mood":
+        log_entry("checkin", f"mood: {answer}", {"source": "evening_review"})
+        send_buttons(chat_id,
+            "Did you do something for yourself today? (exercise, rest, hobby, family time)",
+            ["Yes, felt good", "A little", "No, all work", "No and I feel it"]
+        )
+    elif step == "selfcare":
+        log_entry("evening", f"Self care: {answer}")
+        send_message(chat_id,
+            "Evening logged. What is one thing you are grateful for today? Just type it."
+        )
 
 # ── Reminders ────────────────────────────────────────────────────────────────────
 def fire_reminder(chat_id, message):
@@ -308,12 +352,10 @@ def morning_learning(chat_id):
         print(f"Morning learning error: {e}")
 
 def evening_review(chat_id):
-    send_message(chat_id,
-        "Evening check-in.\n\n"
-        "1. Did you complete your priorities today?\n"
-        "2. What was your win of the day?\n"
-        "3. What are you *grateful* for today?\n\n"
-        "Reply naturally and I will log it.")
+    send_buttons(chat_id,
+        "Good evening! Time for your daily review.\n\nHow did today go overall?",
+        ["Amazing", "Good", "Average", "Tough", "Terrible"]
+    )
 
 def weekly_values_audit(chat_id):
     send_message(chat_id,
@@ -343,14 +385,15 @@ def setup_daily_schedules(chat_id):
     wake_h,  wake_m  = map(int, wake_time.split(":"))
     sleep_h, sleep_m = map(int, sleep_time.split(":"))
 
-    # Good morning message always at 8:00 AM
+    # Good morning always at 8:00 AM IST
     scheduler.add_job(good_morning, "cron", hour=8, minute=0,
                       args=[chat_id], id="good_morning", replace_existing=True)
     scheduler.add_job(morning_learning, "cron", hour=wake_h, minute=wake_m,
                       args=[chat_id], id="daily_learning", replace_existing=True)
     scheduler.add_job(morning_standup, "cron", hour=wake_h, minute=wake_m+15,
                       args=[chat_id], id="daily_standup", replace_existing=True)
-    scheduler.add_job(evening_review, "cron", hour=sleep_h-1, minute=sleep_m,
+    # Evening review always at 10:00 PM IST
+    scheduler.add_job(evening_review, "cron", hour=22, minute=0,
                       args=[chat_id], id="evening_review", replace_existing=True)
     scheduler.add_job(weekly_values_audit, "cron", day_of_week="sun", hour=10, minute=0,
                       args=[chat_id], id="values_audit", replace_existing=True)
@@ -772,6 +815,45 @@ def main():
             updates = get_updates(offset)
             for update in updates:
                 offset = update["update_id"] + 1
+
+                # Handle button taps
+                if update.get("callback_query"):
+                    cb = update["callback_query"]
+                    answer_callback(cb["id"])
+                    cb_chat_id = cb["message"]["chat"]["id"]
+                    cb_user_id = cb["from"]["id"]
+                    if cb_user_id != ALLOWED_USER_ID:
+                        continue
+                    cb_data = cb["data"]
+
+                    # Evening review flow
+                    evening_steps = ["Amazing","Good","Average","Tough","Terrible"]
+                    priority_steps = ["All of them","Most of them","Some of them","None of them"]
+                    energy_steps = ["High all day","High then crashed","Low but steady","Very low"]
+                    mood_steps = ["Great","Good","Neutral","Stressed","Low"]
+                    selfcare_steps = ["Yes, felt good","A little","No, all work","No and I feel it"]
+
+                    if cb_data in evening_steps:
+                        handle_evening_callback("overall", cb_data, cb_chat_id)
+                    elif cb_data in priority_steps:
+                        handle_evening_callback("priorities", cb_data, cb_chat_id)
+                    elif cb_data in energy_steps:
+                        handle_evening_callback("energy", cb_data, cb_chat_id)
+                    elif cb_data in mood_steps:
+                        handle_evening_callback("mood", cb_data, cb_chat_id)
+                    elif cb_data in selfcare_steps:
+                        handle_evening_callback("selfcare", cb_data, cb_chat_id)
+                    else:
+                        # Any other button — treat as text message to Claude
+                        send_typing(cb_chat_id)
+                        try:
+                            reply = ask_claude(cb_data, cb_chat_id)
+                            if reply:
+                                send_message(cb_chat_id, reply)
+                        except Exception as e:
+                            send_message(cb_chat_id, f"Error: {str(e)[:200]}")
+                    continue
+
                 message = update.get("message", {})
                 if not message:
                     continue
